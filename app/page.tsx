@@ -48,7 +48,14 @@ export default function Page() {
   const [pending, setPending] = useState<Array<Attachment & { size: number }>>([]);
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [retryCooldown, setRetryCooldown] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+
+  useEffect(() => {
+    if (retryCooldown <= 0) return;
+    const t = setTimeout(() => setRetryCooldown((s) => s - 1), 1000);
+    return () => clearTimeout(t);
+  }, [retryCooldown]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -106,7 +113,7 @@ export default function Page() {
 
   async function send() {
     const text = input.trim();
-    if ((!text && pending.length === 0) || streaming) return;
+    if ((!text && pending.length === 0) || streaming || retryCooldown > 0) return;
     setError(null);
 
     const attachments: Attachment[] | undefined = pending.length
@@ -134,11 +141,28 @@ export default function Page() {
       });
 
       if (!res.ok || !res.body) {
-        const errBody = await res.json().catch(() => ({ error: "Request failed" }));
-        setMessages([
-          ...next,
-          { role: "assistant", content: `Error: ${errBody.error ?? res.statusText}` },
-        ]);
+        const errBody: {
+          error?: string;
+          message?: string;
+          retryAfter?: number;
+        } = await res.json().catch(() => ({ error: "request_failed" }));
+
+        // Drop the empty assistant placeholder; show the error in a banner.
+        setMessages(next);
+
+        if (res.status === 429) {
+          const wait = Math.max(10, Math.min(120, errBody.retryAfter ?? 60));
+          setError(
+            errBody.message ??
+              "Het is even druk bij Gaston — probeer het over een minuut opnieuw.",
+          );
+          setRetryCooldown(wait);
+        } else {
+          setError(
+            errBody.message ??
+              `Er ging iets mis (${res.status}). Probeer het opnieuw.`,
+          );
+        }
         setStreaming(false);
         return;
       }
@@ -281,7 +305,18 @@ export default function Page() {
             </div>
           )}
 
-          {error && <div className="composer-error">{error}</div>}
+          {error && (
+            <div
+              className={`composer-error ${retryCooldown > 0 ? "is-cooldown" : ""}`}
+            >
+              <span>{error}</span>
+              {retryCooldown > 0 && (
+                <span className="cooldown-pill">
+                  Probeer opnieuw over {retryCooldown}s
+                </span>
+              )}
+            </div>
+          )}
 
           <div className="composer">
             <button
@@ -319,14 +354,22 @@ export default function Page() {
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
               onPaste={onPaste}
-              placeholder="Ask Gaston… or drop a PDF, Word doc, image, or text file"
+              placeholder={
+                retryCooldown > 0
+                  ? `Even wachten… (${retryCooldown}s)`
+                  : "Ask Gaston… or drop a PDF, Word doc, image, or text file"
+              }
               rows={1}
-              disabled={streaming}
+              disabled={streaming || retryCooldown > 0}
             />
             <button
               className="send-btn"
               onClick={send}
-              disabled={streaming || (!input.trim() && pending.length === 0)}
+              disabled={
+                streaming ||
+                retryCooldown > 0 ||
+                (!input.trim() && pending.length === 0)
+              }
             >
               Send
             </button>

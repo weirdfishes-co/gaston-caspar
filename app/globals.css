@@ -545,9 +545,31 @@ main {
   color: #b8002e;
   background: #fdecec;
   font-size: 12px;
-  padding: 6px 10px;
+  padding: 8px 12px;
   border-radius: 4px;
   margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  line-height: 1.5;
+}
+
+.composer-error.is-cooldown {
+  color: var(--nyenrode-dark);
+  background: #fff5dc;
+  border-left: 3px solid var(--nyenrode-accent);
+}
+
+.cooldown-pill {
+  flex-shrink: 0;
+  background: var(--nyenrode-accent);
+  color: var(--nyenrode-dark);
+  font-weight: 700;
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  letter-spacing: 0.04em;
 }
 
 /* Drag-and-drop overlay */

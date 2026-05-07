@@ -6,6 +6,11 @@ import { DOCX_MIME, type ClientMessage, type Attachment } from "@/lib/types";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
+// Keep at most this many of the most recent turns in the request to Anthropic.
+// Each "turn" is one message (user or assistant). Older turns are dropped to
+// stay under the input-token rate limit and to keep latency reasonable.
+const MAX_HISTORY_TURNS = 12;
+
 type AnthropicContentBlock =
   | { type: "text"; text: string }
   | {
@@ -94,11 +99,21 @@ async function toAnthropicMessage(m: ClientMessage) {
   return { role: "user" as const, content: blocks };
 }
 
+// Trim conversation to the most recent N turns, but always start with a
+// user-role message so the API accepts it.
+function trimHistory(messages: ClientMessage[]): ClientMessage[] {
+  const trimmed = messages.slice(-MAX_HISTORY_TURNS);
+  while (trimmed.length > 0 && trimmed[0].role !== "user") {
+    trimmed.shift();
+  }
+  return trimmed.length > 0 ? trimmed : messages.slice(-1);
+}
+
 export async function POST(req: Request) {
   if (!process.env.ANTHROPIC_API_KEY) {
-    return new Response(
-      JSON.stringify({ error: "Server is missing ANTHROPIC_API_KEY." }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
+    return Response.json(
+      { error: "server_misconfigured", message: "Server is missing ANTHROPIC_API_KEY." },
+      { status: 500 },
     );
   }
 
@@ -110,27 +125,72 @@ export async function POST(req: Request) {
       throw new Error("messages must be a non-empty array");
     }
   } catch {
-    return new Response(JSON.stringify({ error: "Invalid request body." }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
+    return Response.json(
+      { error: "bad_request", message: "Invalid request body." },
+      { status: 400 },
+    );
   }
 
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const apiMessages = await Promise.all(
+    trimHistory(messages).map(toAnthropicMessage),
+  );
+
+  // Open the stream BEFORE returning the Response so we can catch 429/5xx
+  // synchronously and return a clean JSON error instead of leaking it into
+  // a 200 text/plain stream.
+  let apiStream;
+  try {
+    apiStream = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      messages: apiMessages as any,
+      stream: true,
+    });
+  } catch (err) {
+    if (err instanceof Anthropic.APIError && err.status === 429) {
+      const headers = (err as unknown as { headers?: Record<string, string> })
+        .headers;
+      const retryAfter = Number(headers?.["retry-after"]) || 30;
+      return Response.json(
+        {
+          error: "rate_limit",
+          message:
+            "Het is even druk bij Gaston — er staan veel verzoeken in de wachtrij. Probeer het over ongeveer een minuut opnieuw.",
+          retryAfter,
+        },
+        { status: 429 },
+      );
+    }
+    if (err instanceof Anthropic.APIError) {
+      return Response.json(
+        {
+          error: "upstream_error",
+          message:
+            err.status === 401 || err.status === 403
+              ? "De server kan niet authenticeren bij het AI-model. Neem contact op met de beheerder."
+              : "Gaston kon het AI-model niet bereiken. Probeer het opnieuw.",
+          status: err.status,
+        },
+        { status: 502 },
+      );
+    }
+    return Response.json(
+      {
+        error: "unknown_error",
+        message:
+          err instanceof Error ? err.message : "Onbekende fout bij het AI-model.",
+      },
+      { status: 500 },
+    );
+  }
 
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
       try {
-        const apiMessages = await Promise.all(messages.map(toAnthropicMessage));
-        const apiStream = await client.messages.stream({
-          model: "claude-sonnet-4-6",
-          max_tokens: 4096,
-          system: SYSTEM_PROMPT,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          messages: apiMessages as any,
-        });
-
         for await (const event of apiStream) {
           if (
             event.type === "content_block_delta" &&
@@ -143,7 +203,11 @@ export async function POST(req: Request) {
       } catch (err) {
         const msg =
           err instanceof Error ? err.message : "Unknown error from Anthropic API";
-        controller.enqueue(encoder.encode(`\n\n[Error: ${msg}]`));
+        controller.enqueue(
+          encoder.encode(
+            `\n\n[Verbinding met Gaston werd onderbroken: ${msg}. Probeer het opnieuw.]`,
+          ),
+        );
         controller.close();
       }
     },
